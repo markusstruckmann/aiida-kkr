@@ -23,7 +23,7 @@ from numpy import array, mean, std, min, sort
 __copyright__ = (u"Copyright (c), 2018, Forschungszentrum Jülich GmbH, "
                  "IAS-1/PGI-1, Germany. All rights reserved.")
 __license__ = "MIT license, see LICENSE.txt file"
-__version__ = "0.4"
+__version__ = "0.5"
 __contributors__ = u"Philipp Rüßmann"
 
 
@@ -104,7 +104,11 @@ class kkr_eos_wc(WorkChain):
             cls.run_vorostart,
             # 4. check voronoi output and extract RMTCORE parameter
             cls.check_voro_out,
-            # 5. submit KKR calculations for all steps
+            # 5. submit first KKR calculation for smallest
+            cls.run_kkr_first_step,
+            # 6. check if smallest volume was succesful
+            cls.check_kkr1_and_genpot,
+            # 7. submit rest of KKR calculations, reusing genpot of first calculation
             cls.run_kkr_steps,
             # 6. collect output and fit results
             cls.collect_data_and_fit,
@@ -238,12 +242,13 @@ class kkr_eos_wc(WorkChain):
         self.ctx.smallest_voro_remote=smallest_voro_remote
 
 
-    def run_kkr_steps(self):
+    def run_kkr_first_step(self):
         """
-        submit KKR calculations for all structures, skip vorostart step for smallest structure
+        submit first KKR calculation (smallest volume) skip vorostart step (done already)
+        output is reused in rest of the claculations to speed up convergence
         """
 
-        self.report('INFO: running kkr scf steps')
+        self.report('INFO: running first kkr scf step')
         # params for scf wfd
         wfd = kkr_scf_wc.get_wf_defaults()
         set_keys = []
@@ -251,35 +256,86 @@ class kkr_eos_wc(WorkChain):
         for key in self.ctx.wf_options.keys():
             wfd[key] = self.ctx.wf_options.get(key)
             set_keys.append(key)
-        # then set ef_settings
+        # then set wf_settings
         kkr_scf_settings = self.ctx.wf_parameters.get('settings_kkr_scf')
         for key in kkr_scf_settings.keys():
             if key not in set_keys: # skip setting of options (done above already)
                 wfd[key] = kkr_scf_settings[key]
 
-        # used to collect all submitted calculations
-        calcs = {}
+        # for first KKR claculation also add genpot option to have genpot available for reuse in the following KKR steps
+        # adding GENPOT to runopts
+        params_kkr_first = kkrparams(**self.ctx.params_kkr_run.get_dict())
+        runopt = params_kkr_first.get_value('RUNOPT')
+        runopt.append('GENPOT')
+        params_kkr_first.set_value('RUNOPT', runopt)
+        # update parameter settings using workfunction for provenance tracking
+        kkr_params_genpot_out = update_params_wf(self.ctx.params_kkr_run, ParameterData(dict=voro_params_with_rmtcore_dict))
         
         # submit first calculation separately
         self.report('submit calc for scale fac= {} on {}'.format(self.ctx.scale_factors[0], self.ctx.scaled_structures[0].get_formula()))
         future = self.submit(kkr_scf_wc, kkr=self.ctx.kkr, remote_data=self.ctx.smallest_voro_remote, 
-                             wf_parameters=ParameterData(dict=wfd), calc_parameters=self.ctx.params_kkr_run)
+                             wf_parameters=ParameterData(dict=wfd), calc_parameters=kkr_params_genpot_out)
         scale_fac = self.ctx.scale_factors[0]
-        calcs['kkr_{}_{}'.format(1, scale_fac)] = future
-        self.ctx.sub_wf_ids['kkr_scf_1'] = future.uuid
 
+
+        # save uuids of calculations to context
+        self.ctx.sub_wf_ids['kkr_scf_1'] = future.uuid
+        # used to extract data:
+        self.ctx.kkr_calc_uuids = []
+        self.ctx.kkr_calc_uuids.append(future.uuid)
+
+        self.report('INFO: submitted calculation: {}'.format(future))
+
+        return ToContext(kkr_1=future)
+
+
+    def run_kkr_steps(self):
+        """
+        submit rest of KKR calculations for all structures, skip first step for smallest structure and reuse converged potential from there
+        """
+
+        # first check if first calculation for smallest valume was succesful
+        if not self.ctx.kkr_1.is_finished_ok:
+            return self.exit_code.ERROR_FIRST_KKR_FAILED
+
+        if not self.ctx.kkr_1.out.output_kkr_scf_wc_ParameterResults.get_dict().get('successful'):
+            return self.exit_code.ERROR_FIRST_KKR_FAILED
+
+        # extract remote of first kkr calculation (used to get genpot file)
+        uuid_kkr1_remote = self.ctx.kkr_1.out.output_kkr_scf_wc_ParameterResults.get_dict().get('last_remote_nodeinfo').get('uuid')
+        kkr1_remote = load_node(uuid_kkr1_remote)
+
+        self.report('INFO: running kkr scf steps')
+
+        # params for scf wfd
+        wfd = kkr_scf_wc.get_wf_defaults()
+        set_keys = []
+        # first set options
+        for key in self.ctx.wf_options.keys():
+            wfd[key] = self.ctx.wf_options.get(key)
+            set_keys.append(key)
+        # then set wf_settings
+        kkr_scf_settings = self.ctx.wf_parameters.get('settings_kkr_scf')
+        for key in kkr_scf_settings.keys():
+            if key not in set_keys: # skip setting of options (done above already)
+                wfd[key] = kkr_scf_settings[key]
+
+
+        # used to collect all submitted calculations
+        calcs = {}
+        
         # then also submit the rest of the calculations
         for i in range(len(self.ctx.scale_factors)-1):
             scale_fac = self.ctx.scale_factors[i+1]
             scaled_struc = self.ctx.scaled_structures[i+1]
             self.report('submit calc for scale fac= {} on {}'.format(scale_fac, scaled_struc.get_formula()))
             future = self.submit(kkr_scf_wc, structure=scaled_struc, kkr=self.ctx.kkr, voronoi=self.ctx.voro, 
-                                 wf_parameters=ParameterData(dict=wfd), calc_parameters=self.ctx.params_kkr_run)
+                                 wf_parameters=ParameterData(dict=wfd), calc_parameters=self.ctx.params_kkr_run,
+                                 genpot_info=ParameterData(dict={'remote_data_uuid':kkr1_remote.uuid, 'genpot_filename':'fort.3'}))
             calcs['kkr_{}_{}'.format(i+2, scale_fac)] = future
             self.ctx.sub_wf_ids['kkr_scf_{}'.format(i+2)] = future.uuid
 
         # save uuids of calculations to context
-        self.ctx.kkr_calc_uuids = []
         for name in sort(calcs.keys()): # sorting important to have correct assignment of scaling and structure info later on
             calc = calcs[name]
             self.ctx.kkr_calc_uuids.append(calc.uuid)
